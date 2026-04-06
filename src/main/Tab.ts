@@ -90,11 +90,11 @@ export class Tab {
   }
 
   async getTabHtml(): Promise<string> {
-    return await this.runJs("return document.documentElement.outerHTML");
+    return await this.runJs("document.documentElement?.outerHTML ?? ''");
   }
 
   async getTabText(): Promise<string> {
-    return await this.runJs("return document.documentElement.innerText");
+    return await this.runJs("document.documentElement?.innerText ?? ''");
   }
 
   loadURL(url: string): Promise<void> {
