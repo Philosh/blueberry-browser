@@ -2,11 +2,13 @@ import { is } from "@electron-toolkit/utils";
 import { BaseWindow, WebContentsView } from "electron";
 import { join } from "path";
 import { LLMClient } from "./LLMClient";
+import { SandboxManager } from "./SandboxManager";
 
 export class SideBar {
   private webContentsView: WebContentsView;
   private baseWindow: BaseWindow;
   private llmClient: LLMClient;
+  private _sandboxManager: SandboxManager;
   private isVisible: boolean = true;
 
   constructor(baseWindow: BaseWindow) {
@@ -15,8 +17,9 @@ export class SideBar {
     baseWindow.contentView.addChildView(this.webContentsView);
     this.setupBounds();
 
-    // Initialize LLM client
+    this._sandboxManager = new SandboxManager();
     this.llmClient = new LLMClient(this.webContentsView.webContents);
+    this.llmClient.setSandboxManager(this._sandboxManager);
   }
 
   private createWebContentsView(): WebContentsView {
@@ -78,6 +81,10 @@ export class SideBar {
 
   get client(): LLMClient {
     return this.llmClient;
+  }
+
+  get sandbox(): SandboxManager {
+    return this._sandboxManager;
   }
 
   show(): void {

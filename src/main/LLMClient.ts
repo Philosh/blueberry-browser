@@ -5,6 +5,7 @@ import { anthropic } from "@ai-sdk/anthropic";
 import * as dotenv from "dotenv";
 import { join } from "path";
 import type { Window } from "./Window";
+import type { SandboxManager } from "./SandboxManager";
 
 // Load environment variables from .env file
 dotenv.config({ path: join(__dirname, "../../.env") });
@@ -27,11 +28,14 @@ const DEFAULT_MODELS: Record<LLMProvider, string> = {
 };
 
 const MAX_CONTEXT_LENGTH = 4000;
+const MAX_FILE_CONTEXT_LENGTH = 50_000;
+const MAX_SINGLE_FILE_LENGTH = 15_000;
 const DEFAULT_TEMPERATURE = 0.7;
 
 export class LLMClient {
   private readonly webContents: WebContents;
   private window: Window | null = null;
+  private sandboxManager: SandboxManager | null = null;
   private readonly provider: LLMProvider;
   private readonly modelName: string;
   private readonly model: LanguageModel | null;
@@ -46,9 +50,12 @@ export class LLMClient {
     this.logInitializationStatus();
   }
 
-  // Set the window reference after construction to avoid circular dependencies
   setWindow(window: Window): void {
     this.window = window;
+  }
+
+  setSandboxManager(manager: SandboxManager): void {
+    this.sandboxManager = manager;
   }
 
   private getProvider(): LLMProvider {
@@ -117,18 +124,30 @@ export class LLMClient {
         }
       }
 
-      // Build user message content with screenshot first, then text
       const userContent: any[] = [];
       
-      // Add screenshot as the first part if available
       if (screenshot) {
         userContent.push({
           type: "image",
           image: screenshot,
         });
       }
-      
-      // Add text content
+
+      // Include sandbox image files in the first message that references them
+      if (this.sandboxManager?.hasFiles()) {
+        for (const file of this.sandboxManager.getAllFiles()) {
+          if (file.mimeType.startsWith("image/")) {
+            const contents = await this.sandboxManager.readFileContents(file.id);
+            if (contents?.dataUrl) {
+              userContent.push({
+                type: "image",
+                image: contents.dataUrl,
+              });
+            }
+          }
+        }
+      }
+
       userContent.push({
         type: "text",
         text: request.message,
@@ -175,7 +194,6 @@ export class LLMClient {
   }
 
   private async prepareMessagesWithContext(_request: ChatRequest): Promise<CoreMessage[]> {
-    // Get page context from active tab
     let pageUrl: string | null = null;
     let pageText: string | null = null;
     
@@ -191,17 +209,60 @@ export class LLMClient {
       }
     }
 
-    // Build system message
+    const fileContext = await this.buildFileContext();
+
     const systemMessage: CoreMessage = {
       role: "system",
-      content: this.buildSystemPrompt(pageUrl, pageText),
+      content: this.buildSystemPrompt(pageUrl, pageText, fileContext),
     };
 
-    // Include all messages in history (system + conversation)
     return [systemMessage, ...this.messages];
   }
 
-  private buildSystemPrompt(url: string | null, pageText: string | null): string {
+  private async buildFileContext(): Promise<string | null> {
+    if (!this.sandboxManager || !this.sandboxManager.hasFiles()) return null;
+
+    const files = this.sandboxManager.getAllFiles();
+    const sections: string[] = [];
+    let totalLength = 0;
+
+    for (const file of files) {
+      if (totalLength >= MAX_FILE_CONTEXT_LENGTH) {
+        sections.push(
+          `\n[Additional files truncated — ${files.length - sections.length} file(s) omitted due to context limits]`
+        );
+        break;
+      }
+
+      const contents = await this.sandboxManager.readFileContents(file.id);
+      if (!contents) continue;
+
+      if (contents.text) {
+        const truncated = this.truncateText(contents.text, MAX_SINGLE_FILE_LENGTH);
+        const section = `--- ${file.name} (${this.formatFileSize(file.size)}) ---\n${truncated}`;
+        sections.push(section);
+        totalLength += section.length;
+      } else if (contents.dataUrl) {
+        sections.push(
+          `--- ${file.name} (${this.formatFileSize(file.size)}) ---\n[Image file — included in the conversation as an image attachment]`
+        );
+      }
+    }
+
+    return sections.length > 0 ? sections.join("\n\n") : null;
+  }
+
+  private formatFileSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes}B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+  }
+
+  private buildSystemPrompt(
+    url: string | null,
+    pageText: string | null,
+    fileContext: string | null
+  ): string {
     const parts: string[] = [
       "You are a helpful AI assistant integrated into a web browser.",
       "You can analyze and discuss web pages with the user.",
@@ -217,9 +278,19 @@ export class LLMClient {
       parts.push(`\nPage content (text):\n${truncatedText}`);
     }
 
+    if (fileContext) {
+      parts.push(
+        "\n## Uploaded Files",
+        "The user has uploaded the following files to a sandboxed environment. " +
+          "Use ONLY these files as context when answering file-related questions. " +
+          "Do not assume access to any files outside this sandbox.",
+        fileContext
+      );
+    }
+
     parts.push(
-      "\nPlease provide helpful, accurate, and contextual responses about the current webpage.",
-      "If the user asks about specific content, refer to the page content and/or screenshot provided."
+      "\nPlease provide helpful, accurate, and contextual responses.",
+      "If the user asks about specific content, refer to the page content, uploaded files, and/or screenshot provided."
     );
 
     return parts.join("\n");

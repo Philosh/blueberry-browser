@@ -8,15 +8,23 @@ interface Message {
     isStreaming?: boolean
 }
 
+export interface FileManifest {
+    id: string
+    name: string
+    mimeType: string
+    size: number
+}
+
 interface ChatContextType {
     messages: Message[]
     isLoading: boolean
+    files: FileManifest[]
 
-    // Chat actions
     sendMessage: (content: string) => Promise<void>
     clearChat: () => void
+    uploadFiles: () => Promise<void>
+    removeFile: (fileId: string) => Promise<void>
 
-    // Page content access
     getPageContent: () => Promise<string | null>
     getPageText: () => Promise<string | null>
     getCurrentUrl: () => Promise<string | null>
@@ -35,30 +43,32 @@ export const useChat = () => {
 export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [messages, setMessages] = useState<Message[]>([])
     const [isLoading, setIsLoading] = useState(false)
+    const [files, setFiles] = useState<FileManifest[]>([])
 
-    // Load initial messages from main process
     useEffect(() => {
-        const loadMessages = async () => {
+        const loadInitialState = async () => {
             try {
                 const storedMessages = await window.sidebarAPI.getMessages()
                 if (storedMessages && storedMessages.length > 0) {
-                    // Convert CoreMessage format to our frontend Message format
                     const convertedMessages = storedMessages.map((msg: any, index: number) => ({
                         id: `msg-${index}`,
                         role: msg.role,
-                        content: typeof msg.content === 'string' 
-                            ? msg.content 
+                        content: typeof msg.content === 'string'
+                            ? msg.content
                             : msg.content.find((p: any) => p.type === 'text')?.text || '',
                         timestamp: Date.now(),
                         isStreaming: false
                     }))
                     setMessages(convertedMessages)
                 }
+
+                const existingFiles = await window.sidebarAPI.getFiles()
+                if (existingFiles) setFiles(existingFiles)
             } catch (error) {
-                console.error('Failed to load messages:', error)
+                console.error('Failed to load initial state:', error)
             }
         }
-        loadMessages()
+        loadInitialState()
     }, [])
 
     const sendMessage = useCallback(async (content: string) => {
@@ -67,13 +77,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         try {
             const messageId = Date.now().toString()
 
-            // Send message to main process (which will handle context)
             await window.sidebarAPI.sendChatMessage({
                 message: content,
                 messageId: messageId
             })
-
-            // Messages will be updated via the chat-messages-updated event
         } catch (error) {
             console.error('Failed to send message:', error)
         } finally {
@@ -85,8 +92,27 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         try {
             await window.sidebarAPI.clearChat()
             setMessages([])
+            setFiles([])
         } catch (error) {
             console.error('Failed to clear chat:', error)
+        }
+    }, [])
+
+    const uploadFiles = useCallback(async () => {
+        try {
+            const manifest = await window.sidebarAPI.uploadFiles()
+            if (manifest) setFiles(manifest)
+        } catch (error) {
+            console.error('Failed to upload files:', error)
+        }
+    }, [])
+
+    const removeFile = useCallback(async (fileId: string) => {
+        try {
+            const manifest = await window.sidebarAPI.removeFile(fileId)
+            setFiles(manifest)
+        } catch (error) {
+            console.error('Failed to remove file:', error)
         }
     }, [])
 
@@ -117,23 +143,19 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
     }, [])
 
-    // Set up message listeners
     useEffect(() => {
-        // Listen for streaming response updates
         const handleChatResponse = (data: { messageId: string; content: string; isComplete: boolean }) => {
             if (data.isComplete) {
                 setIsLoading(false)
             }
         }
 
-        // Listen for message updates from main process
         const handleMessagesUpdated = (updatedMessages: any[]) => {
-            // Convert CoreMessage format to our frontend Message format
             const convertedMessages = updatedMessages.map((msg: any, index: number) => ({
                 id: `msg-${index}`,
                 role: msg.role,
-                content: typeof msg.content === 'string' 
-                    ? msg.content 
+                content: typeof msg.content === 'string'
+                    ? msg.content
                     : msg.content.find((p: any) => p.type === 'text')?.text || '',
                 timestamp: Date.now(),
                 isStreaming: false
@@ -153,8 +175,11 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const value: ChatContextType = {
         messages,
         isLoading,
+        files,
         sendMessage,
         clearChat,
+        uploadFiles,
+        removeFile,
         getPageContent,
         getPageText,
         getCurrentUrl

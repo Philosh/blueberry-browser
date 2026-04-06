@@ -31,14 +31,14 @@ app.whenReady().then(() => {
   });
 });
 
-app.on("window-all-closed", () => {
+app.on("window-all-closed", async () => {
   if (eventManager) {
     eventManager.cleanup();
     eventManager = null;
   }
 
-  // Clean up references
   if (mainWindow) {
+    await mainWindow.sidebar.sandbox.cleanupAll();
     mainWindow = null;
   }
   if (menu) {

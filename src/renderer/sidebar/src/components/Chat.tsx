@@ -2,8 +2,8 @@ import React, { useState, useRef, useEffect, useLayoutEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkBreaks from 'remark-breaks'
-import { ArrowUp, Square, Sparkles, Plus } from 'lucide-react'
-import { useChat } from '../contexts/ChatContext'
+import { ArrowUp, Plus, Paperclip, X, FileText, Image as ImageIcon, File } from 'lucide-react'
+import { useChat, type FileManifest } from '../contexts/ChatContext'
 import { cn } from '@common/lib/utils'
 import { Button } from '@common/components/Button'
 
@@ -150,21 +150,69 @@ const LoadingIndicator: React.FC = () => {
     )
 }
 
+// File icon helper
+const FileIcon: React.FC<{ mimeType: string; className?: string }> = ({ mimeType, className }) => {
+    if (mimeType.startsWith('image/')) return <ImageIcon className={className} />
+    if (mimeType.startsWith('text/') || mimeType === 'application/json') return <FileText className={className} />
+    return <File className={className} />
+}
+
+const formatSize = (bytes: number): string => {
+    if (bytes < 1024) return `${bytes}B`
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`
+    return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
+}
+
+// File chips shown above the input
+const FileChips: React.FC<{
+    files: FileManifest[]
+    onRemove: (id: string) => void
+}> = ({ files, onRemove }) => {
+    if (files.length === 0) return null
+
+    return (
+        <div className="flex flex-wrap gap-1.5 px-3 pb-2">
+            {files.map((file) => (
+                <div
+                    key={file.id}
+                    className={cn(
+                        "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
+                        "bg-muted/60 dark:bg-muted/30 text-xs text-foreground",
+                        "border border-border/50 animate-fade-in"
+                    )}
+                >
+                    <FileIcon mimeType={file.mimeType} className="size-3 text-muted-foreground shrink-0" />
+                    <span className="truncate max-w-[120px]">{file.name}</span>
+                    <span className="text-muted-foreground">{formatSize(file.size)}</span>
+                    <button
+                        onClick={() => onRemove(file.id)}
+                        className="ml-0.5 rounded-full p-0.5 hover:bg-muted-foreground/20 transition-colors"
+                    >
+                        <X className="size-3" />
+                    </button>
+                </div>
+            ))}
+        </div>
+    )
+}
+
 // Chat Input Component with pill design
 const ChatInput: React.FC<{
     onSend: (message: string) => void
     disabled: boolean
-}> = ({ onSend, disabled }) => {
+    files: FileManifest[]
+    onUpload: () => void
+    onRemoveFile: (id: string) => void
+}> = ({ onSend, disabled, files, onUpload, onRemoveFile }) => {
     const [value, setValue] = useState('')
     const [isFocused, setIsFocused] = useState(false)
     const textareaRef = useRef<HTMLTextAreaElement>(null)
 
-    // Auto-resize textarea
     useEffect(() => {
         if (textareaRef.current) {
             textareaRef.current.style.height = 'auto'
             const scrollHeight = textareaRef.current.scrollHeight
-            const newHeight = Math.min(scrollHeight, 200) // Max 200px
+            const newHeight = Math.min(scrollHeight, 200)
             textareaRef.current.style.height = `${newHeight}px`
         }
     }, [value])
@@ -173,7 +221,6 @@ const ChatInput: React.FC<{
         if (value.trim() && !disabled) {
             onSend(value.trim())
             setValue('')
-            // Reset textarea height
             if (textareaRef.current) {
                 textareaRef.current.style.height = '24px'
             }
@@ -193,7 +240,8 @@ const ChatInput: React.FC<{
             "shadow-chat animate-spring-scale outline-none transition-all duration-200",
             isFocused ? "border-primary/20 dark:border-primary/30" : "border-border"
         )}>
-            {/* Input Area */}
+            <FileChips files={files} onRemove={onRemoveFile} />
+
             <div className="w-full px-3 py-2">
                 <div className="w-full flex items-start gap-3">
                     <div className="relative flex-1 overflow-hidden">
@@ -215,8 +263,19 @@ const ChatInput: React.FC<{
                 </div>
             </div>
 
-            {/* Send Button */}
             <div className="w-full flex items-center gap-1.5 px-1 mt-2 mb-1">
+                <button
+                    onClick={onUpload}
+                    disabled={disabled}
+                    className={cn(
+                        "size-9 rounded-full flex items-center justify-center",
+                        "transition-all duration-200 text-muted-foreground",
+                        "hover:bg-muted hover:text-foreground disabled:opacity-50"
+                    )}
+                    title="Attach files"
+                >
+                    <Paperclip className="size-4" />
+                </button>
                 <div className="flex-1" />
                 <button
                     onClick={handleSubmit}
@@ -263,7 +322,7 @@ const ConversationTurnComponent: React.FC<{
 
 // Main Chat Component
 export const Chat: React.FC = () => {
-    const { messages, isLoading, sendMessage, clearChat } = useChat()
+    const { messages, isLoading, sendMessage, clearChat, files, uploadFiles, removeFile } = useChat()
     const scrollRef = useAutoScroll(messages)
 
     // Group messages into conversation turns
@@ -341,7 +400,13 @@ export const Chat: React.FC = () => {
 
             {/* Input Area */}
             <div className="p-4">
-                <ChatInput onSend={sendMessage} disabled={isLoading} />
+                <ChatInput
+                    onSend={sendMessage}
+                    disabled={isLoading}
+                    files={files}
+                    onUpload={uploadFiles}
+                    onRemoveFile={removeFile}
+                />
             </div>
         </div>
     )

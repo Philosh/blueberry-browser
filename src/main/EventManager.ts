@@ -1,4 +1,4 @@
-import { ipcMain, WebContents } from "electron";
+import { ipcMain, dialog, WebContents } from "electron";
 import type { Window } from "./Window";
 
 type GetWindow = () => Window | null;
@@ -40,6 +40,7 @@ export class EventManager {
   private setupEventHandlers(): void {
     this.handleTabEvents();
     this.handleSidebarEvents();
+    this.handleSandboxEvents();
     this.handlePageContentEvents();
     this.handleDarkModeEvents();
     this.handleDebugEvents();
@@ -164,15 +165,46 @@ export class EventManager {
       })
     );
 
-    this.registerHandle("sidebar-clear-chat", () =>
-      this.withWindow((window) => {
+    this.registerHandle("sidebar-clear-chat", async () =>
+      this.withWindow(async (window) => {
         window.sidebar.client.clearMessages();
+        await window.sidebar.sandbox.destroySession();
         return true;
       })
     );
 
     this.registerHandle("sidebar-get-messages", () =>
       this.withWindow((window) => window.sidebar.client.getMessages())
+    );
+  }
+
+  private handleSandboxEvents(): void {
+    this.registerHandle("sandbox-upload-files", async () =>
+      this.withWindow(async (window) => {
+        const result = await dialog.showOpenDialog({
+          properties: ["openFile", "multiSelections"],
+          title: "Upload files to sandbox",
+        });
+
+        if (result.canceled || result.filePaths.length === 0) {
+          return null;
+        }
+
+        const manifest = await window.sidebar.sandbox.addFiles(result.filePaths);
+        return manifest;
+      })
+    );
+
+    this.registerHandle("sandbox-remove-file", async (_, fileId: string) =>
+      this.withWindow(async (window) => {
+        return await window.sidebar.sandbox.removeFile(fileId);
+      })
+    );
+
+    this.registerHandle("sandbox-get-files", () =>
+      this.withWindow((window) => {
+        return window.sidebar.sandbox.getManifest();
+      })
     );
   }
 

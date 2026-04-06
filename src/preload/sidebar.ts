@@ -52,6 +52,12 @@ const sidebarAPI = {
 
   // Tab information
   getActiveTabInfo: () => electronAPI.ipcRenderer.invoke("get-active-tab-info"),
+
+  // Sandbox file management
+  uploadFiles: () => electronAPI.ipcRenderer.invoke("sandbox-upload-files"),
+  removeFile: (fileId: string) =>
+    electronAPI.ipcRenderer.invoke("sandbox-remove-file", fileId),
+  getFiles: () => electronAPI.ipcRenderer.invoke("sandbox-get-files"),
 };
 
 // Use `contextBridge` APIs to expose Electron APIs to
