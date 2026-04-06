@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useLayoutEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkBreaks from 'remark-breaks'
-import { ArrowUp, Plus, Paperclip, X, FileText, Image as ImageIcon, File } from 'lucide-react'
+import { ArrowUp, Plus, Paperclip, X, FileText, Image as ImageIcon, File, Terminal } from 'lucide-react'
 import { useChat, type FileManifest } from '../contexts/ChatContext'
 import { cn } from '@common/lib/utils'
 import { Button } from '@common/components/Button'
@@ -204,7 +204,9 @@ const ChatInput: React.FC<{
     files: FileManifest[]
     onUpload: () => void
     onRemoveFile: (id: string) => void
-}> = ({ onSend, disabled, files, onUpload, onRemoveFile }) => {
+    codeInterpreterEnabled: boolean
+    onToggleCodeInterpreter: () => void
+}> = ({ onSend, disabled, files, onUpload, onRemoveFile, codeInterpreterEnabled, onToggleCodeInterpreter }) => {
     const [value, setValue] = useState('')
     const [isFocused, setIsFocused] = useState(false)
     const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -277,6 +279,21 @@ const ChatInput: React.FC<{
                 >
                     <Paperclip className="size-4" />
                 </button>
+                <button
+                    onClick={onToggleCodeInterpreter}
+                    disabled={disabled}
+                    className={cn(
+                        "h-9 px-3 rounded-full flex items-center gap-2",
+                        "transition-all duration-200 text-xs",
+                        codeInterpreterEnabled
+                            ? "bg-primary text-primary-foreground"
+                            : "bg-muted text-muted-foreground hover:text-foreground"
+                    )}
+                    title="Toggle Code Interpreter (Docker)"
+                >
+                    <Terminal className="size-4" />
+                    CI
+                </button>
                 <div className="flex-1" />
                 <button
                     onClick={handleSubmit}
@@ -323,7 +340,7 @@ const ConversationTurnComponent: React.FC<{
 
 // Main Chat Component
 export const Chat: React.FC = () => {
-    const { messages, isLoading, sendMessage, clearChat, files, uploadFiles, removeFile } = useChat()
+    const { messages, isLoading, sendMessage, clearChat, files, uploadFiles, removeFile, codeInterpreterEnabled, toggleCodeInterpreter } = useChat()
     const scrollRef = useAutoScroll(messages)
 
     // Group messages into conversation turns
@@ -407,6 +424,8 @@ export const Chat: React.FC = () => {
                     files={files}
                     onUpload={uploadFiles}
                     onRemoveFile={removeFile}
+                    codeInterpreterEnabled={codeInterpreterEnabled}
+                    onToggleCodeInterpreter={toggleCodeInterpreter}
                 />
             </div>
         </div>

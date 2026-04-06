@@ -44,7 +44,11 @@ export class DockerCodeExecutor {
 
     const image = language === "python" ? this.pythonImage : this.nodeImage;
     const fileInContainer = `/workspace/${fileName}`;
-    const runCmd = language === "python" ? ["python3", fileInContainer] : ["node", fileInContainer];
+    // Use unbuffered mode for Python so output is flushed reliably.
+    const runCmd =
+      language === "python"
+        ? ["python3", "-u", fileInContainer]
+        : ["node", fileInContainer];
 
     const child = spawn(
       "docker",

@@ -8,6 +8,7 @@ interface ChatRequest {
     text: string | null;
   };
   messageId: string;
+  allowCodeExecution?: boolean;
 }
 
 interface ChatResponse {

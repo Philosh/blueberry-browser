@@ -19,11 +19,13 @@ interface ChatContextType {
     messages: Message[]
     isLoading: boolean
     files: FileManifest[]
+    codeInterpreterEnabled: boolean
 
     sendMessage: (content: string) => Promise<void>
     clearChat: () => void
     uploadFiles: () => Promise<void>
     removeFile: (fileId: string) => Promise<void>
+    toggleCodeInterpreter: () => void
 
     getPageContent: () => Promise<string | null>
     getPageText: () => Promise<string | null>
@@ -44,6 +46,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const [messages, setMessages] = useState<Message[]>([])
     const [isLoading, setIsLoading] = useState(false)
     const [files, setFiles] = useState<FileManifest[]>([])
+    const [codeInterpreterEnabled, setCodeInterpreterEnabled] = useState(false)
 
     useEffect(() => {
         const loadInitialState = async () => {
@@ -77,16 +80,21 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         try {
             const messageId = Date.now().toString()
 
+            // Explicit ask fallback: if user types "run/execute/code interpreter", allow it even if toggle is off.
+            const allowByWording = /(code interpreter|run python|run javascript|run js|execute|run code)/i.test(content)
+
             await window.sidebarAPI.sendChatMessage({
                 message: content,
                 messageId: messageId
+                ,
+                allowCodeExecution: codeInterpreterEnabled || allowByWording
             })
         } catch (error) {
             console.error('Failed to send message:', error)
         } finally {
             setIsLoading(false)
         }
-    }, [])
+    }, [codeInterpreterEnabled])
 
     const clearChat = useCallback(async () => {
         try {
@@ -114,6 +122,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         } catch (error) {
             console.error('Failed to remove file:', error)
         }
+    }, [])
+
+    const toggleCodeInterpreter = useCallback(() => {
+        setCodeInterpreterEnabled(v => !v)
     }, [])
 
     const getPageContent = useCallback(async () => {
@@ -176,10 +188,12 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         messages,
         isLoading,
         files,
+        codeInterpreterEnabled,
         sendMessage,
         clearChat,
         uploadFiles,
         removeFile,
+        toggleCodeInterpreter,
         getPageContent,
         getPageText,
         getCurrentUrl

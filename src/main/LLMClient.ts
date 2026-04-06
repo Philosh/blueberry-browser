@@ -14,6 +14,7 @@ dotenv.config({ path: join(__dirname, "../../.env") });
 interface ChatRequest {
   message: string;
   messageId: string;
+  allowCodeExecution?: boolean;
 }
 
 interface StreamChunk {
@@ -178,11 +179,47 @@ export class LLMClient {
       }
 
       const messages = await this.prepareMessagesWithContext(request);
-      await this.generateWithCodeInterpreter(request, messages, request.messageId);
+      const allowCodeExecution = Boolean(request.allowCodeExecution);
+      if (allowCodeExecution) {
+        await this.generateWithCodeInterpreter(request, messages, request.messageId);
+      } else {
+        await this.generateWithoutCodeInterpreter(request, messages, request.messageId);
+      }
     } catch (error) {
       console.error("Error in LLM request:", error);
       this.handleStreamError(error, request.messageId);
     }
+  }
+
+  private async generateWithoutCodeInterpreter(
+    _request: ChatRequest,
+    messages: CoreMessage[],
+    messageId: string
+  ): Promise<void> {
+    if (!this.model) throw new Error("Model not initialized");
+
+    const result = await generateText({
+      model: this.model,
+      messages,
+      temperature: DEFAULT_TEMPERATURE,
+      maxRetries: 3,
+    });
+
+    const assistantText = (result.text ?? "").trim();
+
+    // If the model outputs a run_code directive while CI is disabled, nudge user to enable it.
+    if (this.extractRunCodeDirective(assistantText)) {
+      const nudge =
+        "Code Interpreter is currently off. Enable it (CI button) or explicitly ask me to run code, then try again.";
+      this.messages.push({ role: "assistant", content: nudge });
+      this.sendMessagesToRenderer();
+      this.sendStreamChunk(messageId, { content: nudge, isComplete: true });
+      return;
+    }
+
+    this.messages.push({ role: "assistant", content: assistantText });
+    this.sendMessagesToRenderer();
+    this.sendStreamChunk(messageId, { content: assistantText, isComplete: true });
   }
 
   private async generateWithCodeInterpreter(
@@ -199,9 +236,29 @@ export class LLMClient {
       const currentMessages =
         step === 0 ? messages : await this.prepareMessagesWithContext(request);
 
+      // Step 1: ask for run_code block only (tool-required style).
+      const requestRunCodeOnly: CoreMessage = {
+        role: "system",
+        content:
+          [
+            "You are in Code Interpreter mode (Docker).",
+            "Respond with ONLY a single <run_code ...> block (no other text).",
+            'If code execution is NOT needed, respond with: <run_code language="python"></run_code>.',
+            "",
+            "Execution environment:",
+            "- Current working directory is /workspace.",
+            "- Uploaded files (if any) are in /workspace. Use filenames or discover via os.listdir('.').",
+            "",
+            "Output requirements (mandatory):",
+            "- The code MUST print the final answer to stdout (e.g. print(result)).",
+            "- If reading files, first print the discovered filenames so the user can see what was used.",
+            "- For numeric answers, print ONLY the number on the last line (after any debug lines).",
+          ].join("\n"),
+      };
+
       const result = await generateText({
         model: this.model,
-        messages: currentMessages,
+        messages: [...currentMessages, requestRunCodeOnly],
         temperature: DEFAULT_TEMPERATURE,
         maxRetries: 3,
       });
@@ -209,15 +266,18 @@ export class LLMClient {
       const assistantText = result.text ?? "";
       const directive = this.extractRunCodeDirective(assistantText);
 
-      // If no execution directive, treat it as the final assistant response.
-      if (!directive || !workspaceDir) {
-        const finalText = assistantText.trim();
+      if (!directive || !workspaceDir || directive.code.trim() === "") {
+        // No code needed, produce a normal final answer without execution.
+        const final = await generateText({
+          model: this.model,
+          messages: currentMessages,
+          temperature: DEFAULT_TEMPERATURE,
+          maxRetries: 3,
+        });
+        const finalText = (final.text ?? "").trim();
         this.messages.push({ role: "assistant", content: finalText });
         this.sendMessagesToRenderer();
-        this.sendStreamChunk(messageId, {
-          content: finalText,
-          isComplete: true,
-        });
+        this.sendStreamChunk(messageId, { content: finalText, isComplete: true });
         return;
       }
 
@@ -235,6 +295,37 @@ export class LLMClient {
         content: `Execution result (${directive.language}):\n${outputText}`,
       });
       this.sendMessagesToRenderer();
+
+      // If execution succeeded but produced no output, force a retry with explicit printing.
+      if (
+        execResult.exitCode === 0 &&
+        !execResult.timedOut &&
+        (execResult.stdout ?? "").trim() === "" &&
+        (execResult.stderr ?? "").trim() === ""
+      ) {
+        this.messages.push({
+          role: "user",
+          content:
+            "The code executed successfully but printed nothing. " +
+            "Please re-run with code that prints the filenames it used and prints the final answer on the last line.",
+        });
+        this.sendMessagesToRenderer();
+        continue;
+      }
+
+      // Step 2: ask for the final explanation using the execution result.
+      const final = await generateText({
+        model: this.model,
+        messages: await this.prepareMessagesWithContext(request),
+        temperature: DEFAULT_TEMPERATURE,
+        maxRetries: 3,
+      });
+
+      const finalText = (final.text ?? "").trim();
+      this.messages.push({ role: "assistant", content: finalText });
+      this.sendMessagesToRenderer();
+      this.sendStreamChunk(messageId, { content: finalText, isComplete: true });
+      return;
     }
 
     const fallback =
@@ -398,18 +489,15 @@ export class LLMClient {
         "The user has uploaded the following files to a sandboxed environment. " +
           "Use ONLY these files as context when answering file-related questions. " +
           "Do not assume access to any files outside this sandbox.",
+        "When using the code interpreter, the sandbox folder is mounted as the current working directory `/workspace`.",
+        "So files should be accessed by name (e.g. `pd.read_csv('file.csv')`) or via `os.listdir('.')` / `pathlib.Path('.')`.",
         fileContext
       );
     }
 
     parts.push(
       "\nPlease provide helpful, accurate, and contextual responses.",
-      "If the user asks about specific content, refer to the page content, uploaded files, and/or screenshot provided.",
-      "\nCode interpreter:",
-      "If you need to run code to analyze the uploaded files, respond with exactly ONE block in the form:",
-      "<run_code language=\"python\">...code...</run_code> or <run_code language=\"javascript\">...code...</run_code>.",
-      "No other text should be included with the block.",
-      "When the execution result is returned, use it to answer the user."
+      "If the user asks about specific content, refer to the page content, uploaded files, and/or screenshot provided."
     );
 
     return parts.join("\n");
