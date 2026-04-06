@@ -74,7 +74,7 @@ const TabItem: React.FC<TabItemProps> = ({
 }
 
 export const TabBar: React.FC = () => {
-    const { tabs, createTab, closeTab, switchTab, isLoading } = useBrowser()
+    const { tabs, createTab, closeTab, switchTab } = useBrowser()
 
     const handleCreateTab = () => {
         createTab('https://www.google.com')

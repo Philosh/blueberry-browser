@@ -1,11 +1,12 @@
 import { WebContents } from "electron";
-import { streamText, type LanguageModel, type CoreMessage } from "ai";
+import { generateText, type LanguageModel, type CoreMessage } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { anthropic } from "@ai-sdk/anthropic";
 import * as dotenv from "dotenv";
 import { join } from "path";
 import type { Window } from "./Window";
 import type { SandboxManager } from "./SandboxManager";
+import { DockerCodeExecutor, type CodeLanguage } from "./DockerCodeExecutor";
 
 // Load environment variables from .env file
 dotenv.config({ path: join(__dirname, "../../.env") });
@@ -30,12 +31,15 @@ const DEFAULT_MODELS: Record<LLMProvider, string> = {
 const MAX_CONTEXT_LENGTH = 4000;
 const MAX_FILE_CONTEXT_LENGTH = 50_000;
 const MAX_SINGLE_FILE_LENGTH = 15_000;
+const MAX_CODE_INTERPRETER_STEPS = 3;
+const MAX_CODE_OUTPUT_LENGTH = 20_000;
 const DEFAULT_TEMPERATURE = 0.7;
 
 export class LLMClient {
   private readonly webContents: WebContents;
   private window: Window | null = null;
   private sandboxManager: SandboxManager | null = null;
+  private readonly dockerCodeExecutor: DockerCodeExecutor;
   private readonly provider: LLMProvider;
   private readonly modelName: string;
   private readonly model: LanguageModel | null;
@@ -43,6 +47,7 @@ export class LLMClient {
 
   constructor(webContents: WebContents) {
     this.webContents = webContents;
+    this.dockerCodeExecutor = new DockerCodeExecutor();
     this.provider = this.getProvider();
     this.modelName = this.getModelName();
     this.model = this.initializeModel();
@@ -173,11 +178,120 @@ export class LLMClient {
       }
 
       const messages = await this.prepareMessagesWithContext(request);
-      await this.streamResponse(messages, request.messageId);
+      await this.generateWithCodeInterpreter(request, messages, request.messageId);
     } catch (error) {
       console.error("Error in LLM request:", error);
       this.handleStreamError(error, request.messageId);
     }
+  }
+
+  private async generateWithCodeInterpreter(
+    request: ChatRequest,
+    messages: CoreMessage[],
+    messageId: string
+  ): Promise<void> {
+    if (!this.model) {
+      throw new Error("Model not initialized");
+    }
+
+    const workspaceDir = this.sandboxManager?.getSandboxDir();
+    for (let step = 0; step < MAX_CODE_INTERPRETER_STEPS; step++) {
+      const currentMessages =
+        step === 0 ? messages : await this.prepareMessagesWithContext(request);
+
+      const result = await generateText({
+        model: this.model,
+        messages: currentMessages,
+        temperature: DEFAULT_TEMPERATURE,
+        maxRetries: 3,
+      });
+
+      const assistantText = result.text ?? "";
+      const directive = this.extractRunCodeDirective(assistantText);
+
+      // If no execution directive, treat it as the final assistant response.
+      if (!directive || !workspaceDir) {
+        const finalText = assistantText.trim();
+        this.messages.push({ role: "assistant", content: finalText });
+        this.sendMessagesToRenderer();
+        this.sendStreamChunk(messageId, {
+          content: finalText,
+          isComplete: true,
+        });
+        return;
+      }
+
+      const execResult = await this.dockerCodeExecutor.execute({
+        language: directive.language,
+        code: directive.code,
+        workspaceDir,
+      });
+
+      const outputText = this.formatExecutionResult(directive.language, execResult);
+
+      // Feed execution output back to the model as new user context.
+      this.messages.push({
+        role: "user",
+        content: `Execution result (${directive.language}):\n${outputText}`,
+      });
+      this.sendMessagesToRenderer();
+    }
+
+    const fallback =
+      "I couldn't complete the code execution flow. Please try again with a clearer request.";
+    this.messages.push({ role: "assistant", content: fallback });
+    this.sendMessagesToRenderer();
+    this.sendStreamChunk(messageId, {
+      content: fallback,
+      isComplete: true,
+    });
+  }
+
+  private extractRunCodeDirective(text: string): { language: CodeLanguage; code: string } | null {
+    // Expected model output:
+    // <run_code language="python">
+    //   ... code ...
+    // </run_code>
+    const re =
+      /<run_code\s+language\s*=\s*["']?(python|javascript|js)["']?\s*>([\s\S]*?)<\/run_code>/i;
+    const match = text.match(re);
+    if (!match) return null;
+
+    const rawLanguage = (match[1] || "").toLowerCase();
+    const language: CodeLanguage =
+      rawLanguage === "python" ? "python" : "javascript";
+
+    let code = (match[2] || "").trim();
+
+    // Strip optional Markdown fences inside the directive.
+    code = code.replace(/^```[a-zA-Z]*\n/, "").replace(/\n```$/, "");
+
+    // Basic safety: keep code from being absurdly large.
+    if (code.length > 30_000) {
+      code = code.slice(0, 30_000);
+    }
+
+    return { language, code };
+  }
+
+  private formatExecutionResult(
+    _language: CodeLanguage,
+    result: { stdout: string; stderr: string; exitCode: number | null; timedOut: boolean }
+  ): string {
+    const stdout = this.truncateText(result.stdout || "", MAX_CODE_OUTPUT_LENGTH);
+    const stderr = this.truncateText(result.stderr || "", MAX_CODE_OUTPUT_LENGTH);
+
+    const exitLine = `exitCode: ${result.exitCode === null ? "null" : result.exitCode}`;
+    const timeoutLine = result.timedOut ? "timedOut: true" : "timedOut: false";
+
+    return [
+      exitLine,
+      timeoutLine,
+      "stdout:",
+      stdout || "(empty)",
+      "stderr:",
+      stderr || "(empty)",
+    ].join("\n");
   }
 
   clearMessages(): void {
@@ -290,7 +404,12 @@ export class LLMClient {
 
     parts.push(
       "\nPlease provide helpful, accurate, and contextual responses.",
-      "If the user asks about specific content, refer to the page content, uploaded files, and/or screenshot provided."
+      "If the user asks about specific content, refer to the page content, uploaded files, and/or screenshot provided.",
+      "\nCode interpreter:",
+      "If you need to run code to analyze the uploaded files, respond with exactly ONE block in the form:",
+      "<run_code language=\"python\">...code...</run_code> or <run_code language=\"javascript\">...code...</run_code>.",
+      "No other text should be included with the block.",
+      "When the execution result is returned, use it to answer the user."
     );
 
     return parts.join("\n");
@@ -299,75 +418,6 @@ export class LLMClient {
   private truncateText(text: string, maxLength: number): string {
     if (text.length <= maxLength) return text;
     return text.substring(0, maxLength) + "...";
-  }
-
-  private async streamResponse(
-    messages: CoreMessage[],
-    messageId: string
-  ): Promise<void> {
-    if (!this.model) {
-      throw new Error("Model not initialized");
-    }
-
-    try {
-      const result = await streamText({
-        model: this.model,
-        messages,
-        temperature: DEFAULT_TEMPERATURE,
-        maxRetries: 3,
-        abortSignal: undefined, // Could add abort controller for cancellation
-      });
-
-      await this.processStream(result.textStream, messageId);
-    } catch (error) {
-      throw error; // Re-throw to be handled by the caller
-    }
-  }
-
-  private async processStream(
-    textStream: AsyncIterable<string>,
-    messageId: string
-  ): Promise<void> {
-    let accumulatedText = "";
-
-    // Create a placeholder assistant message
-    const assistantMessage: CoreMessage = {
-      role: "assistant",
-      content: "",
-    };
-    
-    // Keep track of the index for updates
-    const messageIndex = this.messages.length;
-    this.messages.push(assistantMessage);
-
-    for await (const chunk of textStream) {
-      accumulatedText += chunk;
-
-      // Update assistant message content
-      this.messages[messageIndex] = {
-        role: "assistant",
-        content: accumulatedText,
-      };
-      this.sendMessagesToRenderer();
-
-      this.sendStreamChunk(messageId, {
-        content: chunk,
-        isComplete: false,
-      });
-    }
-
-    // Final update with complete content
-    this.messages[messageIndex] = {
-      role: "assistant",
-      content: accumulatedText,
-    };
-    this.sendMessagesToRenderer();
-
-    // Send the final complete signal
-    this.sendStreamChunk(messageId, {
-      content: accumulatedText,
-      isComplete: true,
-    });
   }
 
   private handleStreamError(error: unknown, messageId: string): void {

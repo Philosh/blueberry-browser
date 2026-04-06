@@ -59,6 +59,7 @@ const StreamingText: React.FC<{ content: string }> = ({ content }) => {
             }, 10)
             return () => clearTimeout(timer)
         }
+        return undefined
     }, [content, currentIndex])
 
     return (
