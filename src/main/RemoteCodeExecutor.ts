@@ -47,7 +47,8 @@ export class RemoteCodeExecutor {
       headers["Authorization"] = `Bearer ${this.apiKey}`;
     }
 
-    const clientTimeoutMs = this.timeoutMs + 15_000;
+    // Server waits up to timeoutMs + VM boot/shutdown overhead (~25s default).
+    const clientTimeoutMs = this.timeoutMs + 40_000;
 
     try {
       const controller = new AbortController();

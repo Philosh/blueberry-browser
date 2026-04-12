@@ -7,7 +7,10 @@ import { buildFirecrackerConfig, getRootfsPath } from "./config";
 import type { ExecutionResult, ExecuteRequest } from "../types";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
-const TIMEOUT_BUFFER_MS = 5_000;
+/** Extra time on top of payload timeoutMs before SIGKILL — covers cold boot + sync + shutdown. */
+const VM_HOST_OVERHEAD_MS = Number(
+  process.env.VM_HOST_OVERHEAD_MS ?? 25_000
+);
 const MAX_CONCURRENT_VMS = Number(process.env.MAX_CONCURRENT_VMS ?? 15);
 
 let activeVMs = 0;
@@ -136,7 +139,7 @@ async function runFirecracker(
   timeoutMs: number
 ): Promise<{ result: ExecutionResult; firecrackerStderr: string }> {
   return new Promise((resolve) => {
-    const totalTimeout = timeoutMs + TIMEOUT_BUFFER_MS;
+    const totalTimeout = timeoutMs + VM_HOST_OVERHEAD_MS;
     let timedOut = false;
     let firecrackerStderr = "";
 
