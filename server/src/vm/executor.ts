@@ -70,6 +70,8 @@ async function injectPayload(
 
   try {
     await execCommand("sudo", ["mount", "-o", "loop", rootfsPath, mountDir]);
+    // Loop-mounted ext4 is root-owned; Node runs as a normal user — grant write access.
+    await chownMountToProcessUser(mountDir);
 
     const payload = {
       language: request.language,
@@ -94,6 +96,16 @@ async function injectPayload(
       // ignore
     }
   }
+}
+
+/** After sudo mount, the image is owned by root; chown so fs.writeFile works. */
+async function chownMountToProcessUser(mountDir: string): Promise<void> {
+  const uid = process.getuid?.();
+  const gid = process.getgid?.();
+  if (uid === undefined || gid === undefined || uid === 0) {
+    return;
+  }
+  await execCommand("sudo", ["chown", "-R", `${uid}:${gid}`, mountDir]);
 }
 
 async function runFirecracker(
