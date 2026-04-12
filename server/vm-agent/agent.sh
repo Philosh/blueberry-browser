@@ -3,6 +3,10 @@
 # Reads /workspace/_payload.json, executes the code, writes /workspace/_result.json, powers off.
 set -e
 
+# PID 1 often has an empty or tiny PATH. Docker Python/Node images install under
+# /usr/local/bin; GNU `timeout` uses execvp and needs PATH or an absolute binary.
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+
 PAYLOAD="/workspace/_payload.json"
 RESULT="/workspace/_result.json"
 
@@ -19,9 +23,25 @@ sleep 0.1
 # ---------------------------------------------------------------------------
 # Detect runtime
 # ---------------------------------------------------------------------------
+PYTHON_BIN=""
+NODE_BIN=""
 if command -v python3 > /dev/null 2>&1; then
+  PYTHON_BIN=$(command -v python3)
+  RUNTIME="python3"
+elif [ -x /usr/local/bin/python3 ]; then
+  PYTHON_BIN=/usr/local/bin/python3
+  RUNTIME="python3"
+elif [ -x /usr/bin/python3 ]; then
+  PYTHON_BIN=/usr/bin/python3
   RUNTIME="python3"
 elif command -v node > /dev/null 2>&1; then
+  NODE_BIN=$(command -v node)
+  RUNTIME="node"
+elif [ -x /usr/local/bin/node ]; then
+  NODE_BIN=/usr/local/bin/node
+  RUNTIME="node"
+elif [ -x /usr/bin/node ]; then
+  NODE_BIN=/usr/bin/node
   RUNTIME="node"
 else
   write_error "No runtime available in VM"
@@ -31,11 +51,11 @@ fi
 # Extract payload fields and write code + uploaded files to /workspace
 # ---------------------------------------------------------------------------
 if [ "$RUNTIME" = "python3" ]; then
-  LANGUAGE=$(python3 -c "import json; print(json.load(open('$PAYLOAD'))['language'])")
-  CODE_EXT=$(python3 -c "print('.py' if '$LANGUAGE'=='python' else '.js')")
-  TIMEOUT=$(python3 -c "import json; print(json.load(open('$PAYLOAD')).get('timeoutMs',30000)//1000)")
+  LANGUAGE=$("$PYTHON_BIN" -c "import json; print(json.load(open('$PAYLOAD'))['language'])")
+  CODE_EXT=$("$PYTHON_BIN" -c "print('.py' if '$LANGUAGE'=='python' else '.js')")
+  TIMEOUT=$("$PYTHON_BIN" -c "import json; print(json.load(open('$PAYLOAD')).get('timeoutMs',30000)//1000)")
 
-  python3 -c "
+  "$PYTHON_BIN" -c "
 import json, base64, os
 payload = json.load(open('$PAYLOAD'))
 ext = '.py' if payload['language'] == 'python' else '.js'
@@ -46,11 +66,11 @@ for entry in payload.get('files', []):
         f.write(base64.b64decode(entry['content_base64']))
 "
 else
-  LANGUAGE=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$PAYLOAD','utf-8')).language)")
-  CODE_EXT=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$PAYLOAD','utf-8')).language==='python'?'.py':'.js')")
-  TIMEOUT=$(node -e "console.log(Math.floor((JSON.parse(require('fs').readFileSync('$PAYLOAD','utf-8')).timeoutMs||30000)/1000))")
+  LANGUAGE=$("$NODE_BIN" -e "console.log(JSON.parse(require('fs').readFileSync('$PAYLOAD','utf-8')).language)")
+  CODE_EXT=$("$NODE_BIN" -e "console.log(JSON.parse(require('fs').readFileSync('$PAYLOAD','utf-8')).language==='python'?'.py':'.js')")
+  TIMEOUT=$("$NODE_BIN" -e "console.log(Math.floor((JSON.parse(require('fs').readFileSync('$PAYLOAD','utf-8')).timeoutMs||30000)/1000))")
 
-  node -e "
+  "$NODE_BIN" -e "
 const fs=require('fs'), path=require('path');
 const p=JSON.parse(fs.readFileSync('$PAYLOAD','utf-8'));
 const ext=p.language==='python'?'.py':'.js';
@@ -74,9 +94,9 @@ TIMED_OUT="false"
 cd /workspace
 
 if [ "$LANGUAGE" = "python" ]; then
-  timeout "${TIMEOUT}s" python3 -u "$EXEC_FILE" > "$STDOUT_FILE" 2> "$STDERR_FILE" || EXIT_CODE=$?
+  timeout "${TIMEOUT}s" "$PYTHON_BIN" -u "$EXEC_FILE" > "$STDOUT_FILE" 2> "$STDERR_FILE" || EXIT_CODE=$?
 else
-  timeout "${TIMEOUT}s" node "$EXEC_FILE" > "$STDOUT_FILE" 2> "$STDERR_FILE" || EXIT_CODE=$?
+  timeout "${TIMEOUT}s" "$NODE_BIN" "$EXEC_FILE" > "$STDOUT_FILE" 2> "$STDERR_FILE" || EXIT_CODE=$?
 fi
 
 [ "$EXIT_CODE" = "124" ] && TIMED_OUT="true"
@@ -87,7 +107,7 @@ fi
 # runtime sees the script — this is intentional.
 # ---------------------------------------------------------------------------
 if [ "$RUNTIME" = "python3" ]; then
-  python3 -c "
+  "$PYTHON_BIN" -c "
 import json
 stdout = stderr = ''
 try:
@@ -104,7 +124,7 @@ json.dump({
 }, open('$RESULT', 'w'))
 "
 else
-  node -e "
+  "$NODE_BIN" -e "
 const fs = require('fs');
 const stdout = fs.existsSync('/tmp/exec_stdout') ? fs.readFileSync('/tmp/exec_stdout','utf-8') : '';
 const stderr = fs.existsSync('/tmp/exec_stderr') ? fs.readFileSync('/tmp/exec_stderr','utf-8') : '';
