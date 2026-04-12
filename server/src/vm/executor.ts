@@ -13,14 +13,34 @@ const VM_HOST_OVERHEAD_MS = Number(
 );
 const MAX_CONCURRENT_VMS = Number(process.env.MAX_CONCURRENT_VMS ?? 15);
 
+/** Logs full Firecracker stderr (truncated) per run. */
 const EXEC_VM_DEBUG =
   process.env.EXEC_VM_DEBUG === "1" || process.env.EXEC_VM_DEBUG === "true";
 
-function vmLog(msg: string, extra?: Record<string, unknown>): void {
+/**
+ * Adds full paths, `_result.json` preview, etc. Default logs stay size-safe.
+ * Use with EXEC_VM_DEBUG for deep triage.
+ */
+const EXEC_VM_VERBOSE =
+  process.env.EXEC_VM_VERBOSE === "1" || process.env.EXEC_VM_VERBOSE === "true";
+
+type VmRunCtx = { runId: string };
+
+function vmLog(
+  msg: string,
+  extra?: Record<string, unknown>,
+  ctx?: VmRunCtx
+): void {
+  const payload =
+    ctx === undefined
+      ? extra
+      : extra === undefined
+        ? { runId: ctx.runId }
+        : { runId: ctx.runId, ...extra };
   const line =
-    extra === undefined
+    payload === undefined
       ? `[vm-exec] ${msg}`
-      : `[vm-exec] ${msg} ${JSON.stringify(extra)}`;
+      : `[vm-exec] ${msg} ${JSON.stringify(payload)}`;
   console.error(line);
 }
 
@@ -39,9 +59,29 @@ export async function executeInVM(
 
   const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const vmId = uuid();
+  const runId = vmId.slice(0, 8);
+  const ctx: VmRunCtx = { runId };
   const vmDir = join(tmpdir(), `fc-${vmId}`);
+  const runStarted = Date.now();
 
   activeVMs++;
+
+  vmLog(
+    "run start",
+    {
+      vmDir,
+      language: request.language,
+      timeoutMs,
+      VM_HOST_OVERHEAD_MS,
+      fileCount: request.files?.length ?? 0,
+      codeChars: request.code?.length ?? 0,
+      uid: process.getuid?.(),
+      gid: process.getgid?.(),
+      activeVMsIncludingThis: activeVMs,
+      FIRECRACKER_DIR: process.env.FIRECRACKER_DIR ?? "/opt/firecracker",
+    },
+    ctx
+  );
 
   try {
     await fs.mkdir(vmDir, { recursive: true });
@@ -53,63 +93,168 @@ export async function executeInVM(
     } catch {
       throw new Error(`Base rootfs not found or unreadable: ${baseRootfs}`);
     }
+    const baseStat = await fs.stat(baseRootfs);
+    const tCopy = Date.now();
     await fs.copyFile(baseRootfs, vmRootfs);
-    vmLog("copied rootfs", { baseRootfs, vmRootfs, language: request.language });
+    const copyMs = Date.now() - tCopy;
+    const copyStat = await fs.stat(vmRootfs);
+    vmLog(
+      "copied rootfs",
+      {
+        baseBytes: baseStat.size,
+        copyBytes: copyStat.size,
+        copyMs,
+        language: request.language,
+        ...(EXEC_VM_VERBOSE ? { baseRootfs, vmRootfs } : {}),
+      },
+      ctx
+    );
 
-    await injectPayload(vmRootfs, request);
-    vmLog("payload injected", { vmRootfs });
+    await injectPayload(vmRootfs, request, ctx);
+    vmLog("payload injected", { vmRootfs: EXEC_VM_VERBOSE ? vmRootfs : "(see run start)" }, ctx);
 
     const config = buildFirecrackerConfig(vmRootfs);
     const configPath = join(vmDir, "config.json");
     await fs.writeFile(configPath, JSON.stringify(config), "utf-8");
+    vmLog(
+      "firecracker config written",
+      {
+        kernel: config["boot-source"]?.kernel_image_path,
+        bootArgs: config["boot-source"]?.boot_args,
+        vcpus: config["machine-config"]?.vcpu_count,
+        memMib: config["machine-config"]?.mem_size_mib,
+        rootDrive: config.drives?.[0]?.path_on_host,
+        ...(EXEC_VM_VERBOSE ? { configPath } : {}),
+      },
+      ctx
+    );
 
     const socketPath = join(vmDir, "api.sock");
     const { result, firecrackerStderr } = await runFirecracker(
       socketPath,
       configPath,
       vmRootfs,
-      timeoutMs
+      timeoutMs,
+      ctx
     );
 
-    return mergeFirecrackerDiagnostics(result, firecrackerStderr);
+    const merged = mergeFirecrackerDiagnostics(
+      result,
+      firecrackerStderr,
+      ctx
+    );
+    vmLog(
+      "run done",
+      {
+        totalMs: Date.now() - runStarted,
+        exitCode: merged.exitCode,
+        timedOut: merged.timedOut,
+        stdoutChars: (merged.stdout ?? "").length,
+        stderrChars: (merged.stderr ?? "").length,
+      },
+      ctx
+    );
+    return merged;
   } finally {
     activeVMs--;
+    const tRm = Date.now();
     try {
       await fs.rm(vmDir, { recursive: true, force: true });
-    } catch {
-      console.error(`Failed to clean up VM dir: ${vmDir}`);
+      vmLog(
+        "vmDir cleanup ok",
+        { rmMs: Date.now() - tRm, vmDir: EXEC_VM_VERBOSE ? vmDir : "(redacted)" },
+        ctx
+      );
+    } catch (e) {
+      vmLog(
+        "vmDir cleanup failed",
+        {
+          vmDir: EXEC_VM_VERBOSE ? vmDir : "(redacted)",
+          err: e instanceof Error ? e.message : String(e),
+        },
+        ctx
+      );
     }
   }
 }
 
 async function injectPayload(
   rootfsPath: string,
-  request: ExecuteRequest
+  request: ExecuteRequest,
+  ctx: VmRunCtx
 ): Promise<void> {
   const mountDir = join(tmpdir(), `fc-mount-${uuid()}`);
   await fs.mkdir(mountDir, { recursive: true });
 
+  const files = request.files ?? [];
+  const filesBytesApprox = files.reduce(
+    (n, f) => n + (f.content_base64?.length ?? 0) * 0.75,
+    0
+  );
+
   try {
-    await execCommand("sudo", ["mount", "-o", "loop", rootfsPath, mountDir]);
-    // Loop-mounted ext4 is root-owned; Node runs as a normal user — grant write access.
-    await chownMountToProcessUser(mountDir);
+    const tMount = Date.now();
+    const mOut = await execCommand("sudo", [
+      "mount",
+      "-o",
+      "loop",
+      rootfsPath,
+      mountDir,
+    ]);
+    vmLog(
+      "inject mount",
+      {
+        mountMs: Date.now() - tMount,
+        exitCode: mOut.exitCode,
+        mountDir: EXEC_VM_VERBOSE ? mountDir : "(tmp)",
+        stderrTail: mOut.stderr ? mOut.stderr.slice(-400) : "",
+      },
+      ctx
+    );
+    if (mOut.exitCode !== 0) {
+      throw new Error(
+        `inject mount failed: ${mOut.stderr || mOut.stdout || "unknown"}`
+      );
+    }
+
+    await chownMountToProcessUser(mountDir, ctx);
 
     const payload = {
       language: request.language,
       code: request.code,
-      files: request.files ?? [],
+      files,
       timeoutMs: request.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     };
     const workspaceDir = join(mountDir, "workspace");
     await fs.mkdir(workspaceDir, { recursive: true });
+    const payloadJson = JSON.stringify(payload);
     await fs.writeFile(
       join(workspaceDir, "_payload.json"),
-      JSON.stringify(payload),
+      payloadJson,
       "utf-8"
     );
+    vmLog(
+      "inject payload file",
+      {
+        payloadJsonBytes: Buffer.byteLength(payloadJson, "utf-8"),
+        fileCount: files.length,
+        filesBytesApprox: Math.round(filesBytesApprox),
+        codeChars: request.code.length,
+      },
+      ctx
+    );
 
-    await execCommand("sudo", ["umount", mountDir]);
-    vmLog("injectPayload umount ok", { mountDir });
+    const tUm = Date.now();
+    const uOut = await execCommand("sudo", ["umount", mountDir]);
+    vmLog(
+      "inject umount",
+      {
+        umountMs: Date.now() - tUm,
+        exitCode: uOut.exitCode,
+        stderrTail: uOut.stderr ? uOut.stderr.slice(-200) : "",
+      },
+      ctx
+    );
   } finally {
     try {
       await execCommand("sudo", ["umount", mountDir]).catch(() => {});
@@ -121,18 +266,40 @@ async function injectPayload(
 }
 
 /** After sudo mount, the image is owned by root; chown so fs.writeFile works. */
-async function chownMountToProcessUser(mountDir: string): Promise<void> {
+async function chownMountToProcessUser(
+  mountDir: string,
+  ctx: VmRunCtx
+): Promise<void> {
   const uid = process.getuid?.();
   const gid = process.getgid?.();
   if (uid === undefined || gid === undefined || uid === 0) {
+    vmLog("chown skipped (root or unsupported)", { uid, gid }, ctx);
     return;
   }
-  await execCommand("sudo", ["chown", "-R", `${uid}:${gid}`, mountDir]);
+  const t0 = Date.now();
+  const out = await execCommand("sudo", [
+    "chown",
+    "-R",
+    `${uid}:${gid}`,
+    mountDir,
+  ]);
+  vmLog(
+    "chown mount",
+    {
+      uid,
+      gid,
+      ms: Date.now() - t0,
+      exitCode: out.exitCode,
+      stderrTail: out.stderr ? out.stderr.slice(-200) : "",
+    },
+    ctx
+  );
 }
 
 function mergeFirecrackerDiagnostics(
   result: ExecutionResult,
-  firecrackerStderr: string
+  firecrackerStderr: string,
+  ctx: VmRunCtx
 ): ExecutionResult {
   const trimmed = firecrackerStderr.trim();
   const isReadFail =
@@ -147,6 +314,11 @@ function mergeFirecrackerDiagnostics(
       "\n\nHint: errno 13 on KVM usually means this user cannot open /dev/kvm. " +
       "Run: sudo usermod -aG kvm $USER  then log out and SSH back in (or: newgrp kvm).";
   }
+  vmLog(
+    "appending firecracker stderr to client error",
+    { stderrChars: trimmed.length },
+    ctx
+  );
   return { ...result, stderr: `${result.stderr}\n\nFirecracker: ${hint}` };
 }
 
@@ -154,7 +326,8 @@ async function runFirecracker(
   socketPath: string,
   configPath: string,
   rootfsPath: string,
-  timeoutMs: number
+  timeoutMs: number,
+  ctx: VmRunCtx
 ): Promise<{ result: ExecutionResult; firecrackerStderr: string }> {
   return new Promise((resolve) => {
     const totalTimeout = timeoutMs + VM_HOST_OVERHEAD_MS;
@@ -163,13 +336,17 @@ async function runFirecracker(
     let firecrackerStderr = "";
     const startedAt = Date.now();
 
-    vmLog("starting firecracker", {
-      timeoutMs,
-      VM_HOST_OVERHEAD_MS,
-      totalTimeoutMs: totalTimeout,
-      socketPath,
-      configPath,
-    });
+    vmLog(
+      "starting firecracker",
+      {
+        timeoutMs,
+        VM_HOST_OVERHEAD_MS,
+        totalTimeoutMs: totalTimeout,
+        socketPath: EXEC_VM_VERBOSE ? socketPath : "(tmp)",
+        configPath: EXEC_VM_VERBOSE ? configPath : "(tmp)",
+      },
+      ctx
+    );
 
     // Guest serial → Firecracker's stdout. If stdout is a pipe and we never read it,
     // the buffer fills and the VMM can block (symptom: ~15s hangs, no _result.json).
@@ -179,45 +356,65 @@ async function runFirecracker(
       { stdio: ["ignore", "ignore", "pipe"] }
     );
 
+    vmLog("firecracker child spawned", { pid: child.pid }, ctx);
+
     child.stderr?.on("data", (chunk: Buffer) => {
       const msg = chunk.toString("utf-8");
       firecrackerStderr += msg;
       const line = msg.trim();
-      if (line) console.error(`[firecracker] ${line}`);
+      if (line) console.error(`[firecracker][${ctx.runId}] ${line}`);
     });
 
     const timer = setTimeout(() => {
       timerFired = true;
       timedOut = true;
-      vmLog("host timer expired, SIGKILL firecracker", {
-        totalTimeoutMs: totalTimeout,
-        elapsedMs: Date.now() - startedAt,
-      });
+      vmLog(
+        "host timer expired, SIGKILL firecracker",
+        {
+          totalTimeoutMs: totalTimeout,
+          elapsedMs: Date.now() - startedAt,
+          pid: child.pid,
+        },
+        ctx
+      );
       child.kill("SIGKILL");
     }, totalTimeout);
 
     child.on("close", async (code, signal) => {
       clearTimeout(timer);
       const elapsedMs = Date.now() - startedAt;
-      vmLog("firecracker exited", {
-        code,
-        signal,
-        elapsedMs,
-        hostTimerFired: timerFired,
-        stderrChars: firecrackerStderr.length,
-      });
+      vmLog(
+        "firecracker exited",
+        {
+          code,
+          signal,
+          elapsedMs,
+          hostTimerFired: timerFired,
+          stderrChars: firecrackerStderr.length,
+          pid: child.pid,
+        },
+        ctx
+      );
       if (EXEC_VM_DEBUG && firecrackerStderr) {
-        vmLog("firecracker stderr (full)", {
-          text: firecrackerStderr.slice(0, 8000),
-        });
+        vmLog(
+          "firecracker stderr (full)",
+          { text: firecrackerStderr.slice(0, 8000) },
+          ctx
+        );
       }
-      const result = await readResult(rootfsPath, timedOut, rootfsPath);
+      const tRead = Date.now();
+      const result = await readResult(rootfsPath, timedOut, rootfsPath, ctx);
+      vmLog(
+        "readResult finished",
+        { readResultMs: Date.now() - tRead },
+        ctx
+      );
       resolve({ result, firecrackerStderr });
     });
 
     child.on("error", (err) => {
       clearTimeout(timer);
-      vmLog("firecracker spawn error", { message: err.message });
+      vmLog("firecracker spawn error", { message: err.message }, ctx);
       resolve({
         result: {
           stdout: "",
@@ -234,26 +431,53 @@ async function runFirecracker(
 async function readResult(
   rootfsPath: string,
   timedOut: boolean,
-  imagePathForLog: string
+  imagePathForLog: string,
+  ctx: VmRunCtx
 ): Promise<ExecutionResult> {
   const mountDir = join(tmpdir(), `fc-read-${uuid()}`);
   await fs.mkdir(mountDir, { recursive: true });
 
+  let imgStat: { size: number } | null = null;
   try {
+    const st = await fs.stat(rootfsPath);
+    imgStat = { size: st.size };
+  } catch {
+    // ignore
+  }
+
+  try {
+    // After the guest runs, ext4 often has a dirty journal. `loop,ro` can fail with
+    // "cannot mount ... read-only" until replay. RW mount replays the journal; we only
+    // read _result.json and discard this image copy immediately after.
+    const tMount = Date.now();
     const mountOut = await execCommand("sudo", [
       "mount",
       "-o",
-      "loop,ro",
+      "loop",
       rootfsPath,
       mountDir,
     ]);
-    if (mountOut.exitCode !== 0) {
-      vmLog("readResult mount failed", {
-        imagePathForLog,
-        stderr: mountOut.stderr,
-        stdout: mountOut.stdout,
+    vmLog(
+      "readResult mount",
+      {
+        mountMs: Date.now() - tMount,
         exitCode: mountOut.exitCode,
-      });
+        imageBytes: imgStat?.size,
+        mountMode: "rw",
+      },
+      ctx
+    );
+    if (mountOut.exitCode !== 0) {
+      vmLog(
+        "readResult mount failed",
+        {
+          imagePathForLog: EXEC_VM_VERBOSE ? imagePathForLog : "(path redacted)",
+          stderr: mountOut.stderr,
+          stdout: mountOut.stdout,
+          exitCode: mountOut.exitCode,
+        },
+        ctx
+      );
       return {
         stdout: "",
         stderr: timedOut
@@ -270,31 +494,64 @@ async function readResult(
     try {
       workspaceListing = await fs.readdir(workspaceDir);
     } catch (e) {
-      vmLog("readResult workspace readdir failed", {
-        workspaceDir,
-        err: e instanceof Error ? e.message : String(e),
-      });
+      vmLog(
+        "readResult workspace readdir failed",
+        {
+          workspaceDir,
+          err: e instanceof Error ? e.message : String(e),
+        },
+        ctx
+      );
     }
 
     try {
       const st = await fs.stat(resultPath);
-      vmLog("readResult _result.json found", {
-        size: st.size,
-        workspaceFiles: workspaceListing,
-      });
+      vmLog(
+        "readResult _result.json found",
+        {
+          size: st.size,
+          workspaceFiles: workspaceListing,
+        },
+        ctx
+      );
       const data = await fs.readFile(resultPath, "utf-8");
+      if (EXEC_VM_VERBOSE) {
+        vmLog(
+          "readResult raw json",
+          { preview: data.slice(0, 500), totalChars: data.length },
+          ctx
+        );
+      }
       const result = JSON.parse(data) as ExecutionResult;
       if (timedOut) result.timedOut = true;
+      vmLog(
+        "readResult parsed",
+        {
+          guestExitCode: result.exitCode,
+          guestTimedOut: result.timedOut,
+          stdoutChars: (result.stdout ?? "").length,
+          stderrChars: (result.stderr ?? "").length,
+        },
+        ctx
+      );
       return result;
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
-      vmLog("readResult failed", {
-        resultPath,
-        workspaceFiles: workspaceListing,
-        err: errMsg,
-        timedOut,
-        imagePathForLog,
-      });
+      const isParse =
+        e instanceof SyntaxError ||
+        (e instanceof Error && e.message.includes("JSON"));
+      vmLog(
+        "readResult failed",
+        {
+          resultPath,
+          workspaceFiles: workspaceListing,
+          err: errMsg,
+          likelyJsonParse: isParse,
+          timedOut,
+          imagePathForLog: EXEC_VM_VERBOSE ? imagePathForLog : "(redacted)",
+        },
+        ctx
+      );
       return {
         stdout: "",
         stderr: timedOut
@@ -306,7 +563,20 @@ async function readResult(
     }
   } finally {
     try {
-      await execCommand("sudo", ["umount", mountDir]).catch(() => {});
+      const tu = Date.now();
+      const u = await execCommand("sudo", ["umount", mountDir]).catch(
+        () =>
+          ({
+            stdout: "",
+            stderr: "umount threw",
+            exitCode: -1,
+          }) as const
+      );
+      vmLog(
+        "readResult umount",
+        { umountMs: Date.now() - tu, exitCode: u.exitCode },
+        ctx
+      );
       await fs.rm(mountDir, { recursive: true, force: true }).catch(() => {});
     } catch {
       // ignore
