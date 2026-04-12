@@ -13,6 +13,17 @@ const VM_HOST_OVERHEAD_MS = Number(
 );
 const MAX_CONCURRENT_VMS = Number(process.env.MAX_CONCURRENT_VMS ?? 15);
 
+const EXEC_VM_DEBUG =
+  process.env.EXEC_VM_DEBUG === "1" || process.env.EXEC_VM_DEBUG === "true";
+
+function vmLog(msg: string, extra?: Record<string, unknown>): void {
+  const line =
+    extra === undefined
+      ? `[vm-exec] ${msg}`
+      : `[vm-exec] ${msg} ${JSON.stringify(extra)}`;
+  console.error(line);
+}
+
 let activeVMs = 0;
 
 export function getActiveVMCount(): number {
@@ -37,9 +48,16 @@ export async function executeInVM(
 
     const baseRootfs = getRootfsPath(request.language);
     const vmRootfs = join(vmDir, "rootfs.ext4");
+    try {
+      await fs.access(baseRootfs);
+    } catch {
+      throw new Error(`Base rootfs not found or unreadable: ${baseRootfs}`);
+    }
     await fs.copyFile(baseRootfs, vmRootfs);
+    vmLog("copied rootfs", { baseRootfs, vmRootfs, language: request.language });
 
     await injectPayload(vmRootfs, request);
+    vmLog("payload injected", { vmRootfs });
 
     const config = buildFirecrackerConfig(vmRootfs);
     const configPath = join(vmDir, "config.json");
@@ -91,6 +109,7 @@ async function injectPayload(
     );
 
     await execCommand("sudo", ["umount", mountDir]);
+    vmLog("injectPayload umount ok", { mountDir });
   } finally {
     try {
       await execCommand("sudo", ["umount", mountDir]).catch(() => {});
@@ -116,11 +135,10 @@ function mergeFirecrackerDiagnostics(
   firecrackerStderr: string
 ): ExecutionResult {
   const trimmed = firecrackerStderr.trim();
-  if (
-    !trimmed ||
-    (result.stderr !== "Failed to read execution result from VM" &&
-      result.stderr !== "Execution timed out")
-  ) {
+  const isReadFail =
+    result.stderr.startsWith("Failed to read execution result from VM") ||
+    result.stderr === "Execution timed out";
+  if (!trimmed || !isReadFail) {
     return result;
   }
   let hint = trimmed;
@@ -141,12 +159,24 @@ async function runFirecracker(
   return new Promise((resolve) => {
     const totalTimeout = timeoutMs + VM_HOST_OVERHEAD_MS;
     let timedOut = false;
+    let timerFired = false;
     let firecrackerStderr = "";
+    const startedAt = Date.now();
 
+    vmLog("starting firecracker", {
+      timeoutMs,
+      VM_HOST_OVERHEAD_MS,
+      totalTimeoutMs: totalTimeout,
+      socketPath,
+      configPath,
+    });
+
+    // Guest serial → Firecracker's stdout. If stdout is a pipe and we never read it,
+    // the buffer fills and the VMM can block (symptom: ~15s hangs, no _result.json).
     const child = spawn(
       "firecracker",
       ["--api-sock", socketPath, "--config-file", configPath],
-      { stdio: ["ignore", "pipe", "pipe"] }
+      { stdio: ["ignore", "ignore", "pipe"] }
     );
 
     child.stderr?.on("data", (chunk: Buffer) => {
@@ -157,18 +187,37 @@ async function runFirecracker(
     });
 
     const timer = setTimeout(() => {
+      timerFired = true;
       timedOut = true;
+      vmLog("host timer expired, SIGKILL firecracker", {
+        totalTimeoutMs: totalTimeout,
+        elapsedMs: Date.now() - startedAt,
+      });
       child.kill("SIGKILL");
     }, totalTimeout);
 
-    child.on("close", async () => {
+    child.on("close", async (code, signal) => {
       clearTimeout(timer);
-      const result = await readResult(rootfsPath, timedOut);
+      const elapsedMs = Date.now() - startedAt;
+      vmLog("firecracker exited", {
+        code,
+        signal,
+        elapsedMs,
+        hostTimerFired: timerFired,
+        stderrChars: firecrackerStderr.length,
+      });
+      if (EXEC_VM_DEBUG && firecrackerStderr) {
+        vmLog("firecracker stderr (full)", {
+          text: firecrackerStderr.slice(0, 8000),
+        });
+      }
+      const result = await readResult(rootfsPath, timedOut, rootfsPath);
       resolve({ result, firecrackerStderr });
     });
 
     child.on("error", (err) => {
       clearTimeout(timer);
+      vmLog("firecracker spawn error", { message: err.message });
       resolve({
         result: {
           stdout: "",
@@ -184,26 +233,73 @@ async function runFirecracker(
 
 async function readResult(
   rootfsPath: string,
-  timedOut: boolean
+  timedOut: boolean,
+  imagePathForLog: string
 ): Promise<ExecutionResult> {
   const mountDir = join(tmpdir(), `fc-read-${uuid()}`);
   await fs.mkdir(mountDir, { recursive: true });
 
   try {
-    await execCommand("sudo", ["mount", "-o", "loop,ro", rootfsPath, mountDir]);
-
-    const resultPath = join(mountDir, "workspace", "_result.json");
-    try {
-      const data = await fs.readFile(resultPath, "utf-8");
-      const result = JSON.parse(data) as ExecutionResult;
-      if (timedOut) result.timedOut = true;
-      return result;
-    } catch {
+    const mountOut = await execCommand("sudo", [
+      "mount",
+      "-o",
+      "loop,ro",
+      rootfsPath,
+      mountDir,
+    ]);
+    if (mountOut.exitCode !== 0) {
+      vmLog("readResult mount failed", {
+        imagePathForLog,
+        stderr: mountOut.stderr,
+        stdout: mountOut.stdout,
+        exitCode: mountOut.exitCode,
+      });
       return {
         stdout: "",
         stderr: timedOut
           ? "Execution timed out"
-          : "Failed to read execution result from VM",
+          : `Failed to mount rootfs for read: ${mountOut.stderr || mountOut.stdout || "mount failed"}`,
+        exitCode: null,
+        timedOut,
+      };
+    }
+
+    const workspaceDir = join(mountDir, "workspace");
+    const resultPath = join(workspaceDir, "_result.json");
+    let workspaceListing: string[] = [];
+    try {
+      workspaceListing = await fs.readdir(workspaceDir);
+    } catch (e) {
+      vmLog("readResult workspace readdir failed", {
+        workspaceDir,
+        err: e instanceof Error ? e.message : String(e),
+      });
+    }
+
+    try {
+      const st = await fs.stat(resultPath);
+      vmLog("readResult _result.json found", {
+        size: st.size,
+        workspaceFiles: workspaceListing,
+      });
+      const data = await fs.readFile(resultPath, "utf-8");
+      const result = JSON.parse(data) as ExecutionResult;
+      if (timedOut) result.timedOut = true;
+      return result;
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      vmLog("readResult failed", {
+        resultPath,
+        workspaceFiles: workspaceListing,
+        err: errMsg,
+        timedOut,
+        imagePathForLog,
+      });
+      return {
+        stdout: "",
+        stderr: timedOut
+          ? "Execution timed out"
+          : `Failed to read execution result from VM (${errMsg}). Workspace: ${workspaceListing.join(", ") || "(none)"}`,
         exitCode: null,
         timedOut,
       };
