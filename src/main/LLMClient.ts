@@ -1,6 +1,6 @@
 import { WebContents } from "electron";
 import { generateText, type LanguageModel, type CoreMessage } from "ai";
-import { openai } from "@ai-sdk/openai";
+import { createOpenAI } from "@ai-sdk/openai";
 import { anthropic } from "@ai-sdk/anthropic";
 import * as dotenv from "dotenv";
 import { join } from "path";
@@ -86,8 +86,18 @@ export class LLMClient {
     switch (this.provider) {
       case "anthropic":
         return anthropic(this.modelName);
-      case "openai":
-        return openai(this.modelName);
+      case "openai": {
+        const isOpenRouter = apiKey.startsWith("sk-or-");
+        const openaiProvider = createOpenAI({
+          apiKey,
+          ...(isOpenRouter && {
+            baseURL: "https://openrouter.ai/api/v1",
+          }),
+        });
+        // Default openai(modelId) uses the Responses API (/v1/responses). Use chat
+        // completions (/v1/chat/completions) so normal project keys and OpenRouter work.
+        return openaiProvider.chat(this.modelName);
+      }
       default:
         return null;
     }
