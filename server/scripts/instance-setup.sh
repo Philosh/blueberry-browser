@@ -19,6 +19,8 @@ sudo apt-get install -y curl wget docker.io e2fsprogs util-linux jq
 echo "==> Adding user to docker and kvm groups"
 sudo usermod -aG docker "$USER"
 sudo usermod -aG kvm "$USER"
+echo "    IMPORTANT: Firecracker needs /dev/kvm. After this script, log out and SSH in"
+echo "    again (or run: newgrp kvm) so the kvm group applies to your session."
 
 echo "==> Installing Firecracker"
 ARCH=$(uname -m)

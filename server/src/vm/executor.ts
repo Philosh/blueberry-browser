@@ -43,14 +43,14 @@ export async function executeInVM(
     await fs.writeFile(configPath, JSON.stringify(config), "utf-8");
 
     const socketPath = join(vmDir, "api.sock");
-    const result = await runFirecracker(
+    const { result, firecrackerStderr } = await runFirecracker(
       socketPath,
       configPath,
       vmRootfs,
       timeoutMs
     );
 
-    return result;
+    return mergeFirecrackerDiagnostics(result, firecrackerStderr);
   } finally {
     activeVMs--;
     try {
@@ -108,15 +108,37 @@ async function chownMountToProcessUser(mountDir: string): Promise<void> {
   await execCommand("sudo", ["chown", "-R", `${uid}:${gid}`, mountDir]);
 }
 
+function mergeFirecrackerDiagnostics(
+  result: ExecutionResult,
+  firecrackerStderr: string
+): ExecutionResult {
+  const trimmed = firecrackerStderr.trim();
+  if (
+    !trimmed ||
+    (result.stderr !== "Failed to read execution result from VM" &&
+      result.stderr !== "Execution timed out")
+  ) {
+    return result;
+  }
+  let hint = trimmed;
+  if (trimmed.includes("Kvm(Error(13))") || trimmed.includes("Error(13)")) {
+    hint +=
+      "\n\nHint: errno 13 on KVM usually means this user cannot open /dev/kvm. " +
+      "Run: sudo usermod -aG kvm $USER  then log out and SSH back in (or: newgrp kvm).";
+  }
+  return { ...result, stderr: `${result.stderr}\n\nFirecracker: ${hint}` };
+}
+
 async function runFirecracker(
   socketPath: string,
   configPath: string,
   rootfsPath: string,
   timeoutMs: number
-): Promise<ExecutionResult> {
-  return new Promise<ExecutionResult>((resolve) => {
+): Promise<{ result: ExecutionResult; firecrackerStderr: string }> {
+  return new Promise((resolve) => {
     const totalTimeout = timeoutMs + TIMEOUT_BUFFER_MS;
     let timedOut = false;
+    let firecrackerStderr = "";
 
     const child = spawn(
       "firecracker",
@@ -125,8 +147,10 @@ async function runFirecracker(
     );
 
     child.stderr?.on("data", (chunk: Buffer) => {
-      const msg = chunk.toString("utf-8").trim();
-      if (msg) console.error(`[firecracker] ${msg}`);
+      const msg = chunk.toString("utf-8");
+      firecrackerStderr += msg;
+      const line = msg.trim();
+      if (line) console.error(`[firecracker] ${line}`);
     });
 
     const timer = setTimeout(() => {
@@ -137,16 +161,19 @@ async function runFirecracker(
     child.on("close", async () => {
       clearTimeout(timer);
       const result = await readResult(rootfsPath, timedOut);
-      resolve(result);
+      resolve({ result, firecrackerStderr });
     });
 
     child.on("error", (err) => {
       clearTimeout(timer);
       resolve({
-        stdout: "",
-        stderr: `Firecracker failed to start: ${err.message}`,
-        exitCode: null,
-        timedOut: false,
+        result: {
+          stdout: "",
+          stderr: `Firecracker failed to start: ${err.message}`,
+          exitCode: null,
+          timedOut: false,
+        },
+        firecrackerStderr,
       });
     });
   });
