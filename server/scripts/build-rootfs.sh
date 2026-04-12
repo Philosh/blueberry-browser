@@ -35,7 +35,12 @@ build_image() {
 
   echo ""
   echo "===> Building Docker image: $TAG"
-  echo "$DOCKERFILE" | docker build -t "$TAG" -f - /tmp
+  # Use an empty context dir — NOT all of /tmp (Ubuntu's /tmp can contain
+  # snap-private-tmp etc. and the legacy docker builder fails with "can't stat").
+  local CTX
+  CTX=$(mktemp -d /tmp/bb-rootfs-ctx-XXXXXX)
+  echo "$DOCKERFILE" | docker build -t "$TAG" -f - "$CTX"
+  rm -rf "$CTX"
 
   echo "===> Exporting filesystem"
   docker rm -f "$CONTAINER" 2>/dev/null || true
