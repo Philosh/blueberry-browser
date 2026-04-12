@@ -1,0 +1,23 @@
+{
+  "name": "blueberry-exec-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Remote code execution API (Firecracker) for Blueberry Browser",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@fastify/rate-limit": "^10.2.2",
+    "fastify": "^5.3.3",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

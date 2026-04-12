@@ -7,6 +7,7 @@ import { join } from "path";
 import type { Window } from "./Window";
 import type { SandboxManager } from "./SandboxManager";
 import { DockerCodeExecutor, type CodeLanguage } from "./DockerCodeExecutor";
+import { RemoteCodeExecutor } from "./RemoteCodeExecutor";
 
 // Load environment variables from .env file
 dotenv.config({ path: join(__dirname, "../../.env") });
@@ -40,7 +41,7 @@ export class LLMClient {
   private readonly webContents: WebContents;
   private window: Window | null = null;
   private sandboxManager: SandboxManager | null = null;
-  private readonly dockerCodeExecutor: DockerCodeExecutor;
+  private readonly codeExecutor: DockerCodeExecutor | RemoteCodeExecutor;
   private readonly provider: LLMProvider;
   private readonly modelName: string;
   private readonly model: LanguageModel | null;
@@ -48,7 +49,11 @@ export class LLMClient {
 
   constructor(webContents: WebContents) {
     this.webContents = webContents;
-    this.dockerCodeExecutor = new DockerCodeExecutor();
+    const useRemote = Boolean(process.env.CODE_EXEC_API_URL);
+    this.codeExecutor = useRemote
+      ? new RemoteCodeExecutor()
+      : new DockerCodeExecutor();
+    console.log(`Code executor: ${useRemote ? "remote" : "local Docker"}`);
     this.provider = this.getProvider();
     this.modelName = this.getModelName();
     this.model = this.initializeModel();
@@ -231,6 +236,9 @@ export class LLMClient {
       throw new Error("Model not initialized");
     }
 
+    if (this.sandboxManager) {
+      await this.sandboxManager.ensureSession();
+    }
     const workspaceDir = this.sandboxManager?.getSandboxDir();
     for (let step = 0; step < MAX_CODE_INTERPRETER_STEPS; step++) {
       const currentMessages =
@@ -241,7 +249,7 @@ export class LLMClient {
         role: "system",
         content:
           [
-            "You are in Code Interpreter mode (Docker).",
+            "You are in Code Interpreter mode.",
             "Respond with ONLY a single <run_code ...> block (no other text).",
             'If code execution is NOT needed, respond with: <run_code language="python"></run_code>.',
             "",
@@ -281,7 +289,7 @@ export class LLMClient {
         return;
       }
 
-      const execResult = await this.dockerCodeExecutor.execute({
+      const execResult = await this.codeExecutor.execute({
         language: directive.language,
         code: directive.code,
         workspaceDir,
