@@ -2,16 +2,49 @@ import { promises as fs } from "fs";
 import { basename, join } from "path";
 import type { CodeLanguage, ExecutionResult } from "./DockerCodeExecutor";
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : fallback;
+}
+
 export class RemoteCodeExecutor {
   private readonly apiUrl: string;
   private readonly apiKey: string;
   private readonly timeoutMs: number;
+  /** Total HTTP attempts for retryable errors (503 / 429). */
+  private readonly maxAttempts: number;
+  private readonly retryBaseMs: number;
 
-  constructor(opts?: { apiUrl?: string; apiKey?: string; timeoutMs?: number }) {
+  constructor(
+    opts?: {
+      apiUrl?: string;
+      apiKey?: string;
+      timeoutMs?: number;
+      maxAttempts?: number;
+      retryBaseMs?: number;
+    }
+  ) {
     this.apiUrl = opts?.apiUrl ?? process.env.CODE_EXEC_API_URL ?? "";
     this.apiKey = opts?.apiKey ?? process.env.CODE_EXEC_API_KEY ?? "";
     this.timeoutMs =
       opts?.timeoutMs ?? Number(process.env.CODE_EXEC_TIMEOUT_MS ?? 30_000);
+    this.maxAttempts = parsePositiveInt(
+      opts?.maxAttempts !== undefined
+        ? String(opts.maxAttempts)
+        : process.env.CODE_EXEC_MAX_ATTEMPTS,
+      3
+    );
+    this.retryBaseMs = parsePositiveInt(
+      opts?.retryBaseMs !== undefined
+        ? String(opts.retryBaseMs)
+        : process.env.CODE_EXEC_RETRY_BASE_MS,
+      500
+    );
   }
 
   async execute(opts: {
@@ -51,23 +84,41 @@ export class RemoteCodeExecutor {
     const clientTimeoutMs = this.timeoutMs + 40_000;
 
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), clientTimeoutMs);
+      let lastStatus = 0;
+      let lastBody = "";
 
-      const response = await fetch(this.apiUrl, {
-        method: "POST",
-        headers,
-        body,
-        signal: controller.signal,
-      });
+      for (let attempt = 0; attempt < this.maxAttempts; attempt++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), clientTimeoutMs);
 
-      clearTimeout(timer);
+        const response = await fetch(this.apiUrl, {
+          method: "POST",
+          headers,
+          body,
+          signal: controller.signal,
+        });
 
-      if (response.ok) {
-        return (await response.json()) as ExecutionResult;
+        clearTimeout(timer);
+
+        if (response.ok) {
+          return (await response.json()) as ExecutionResult;
+        }
+
+        lastStatus = response.status;
+        lastBody = await response.text();
+
+        const retryable = lastStatus === 503 || lastStatus === 429;
+        if (retryable && attempt < this.maxAttempts - 1) {
+          const backoff = this.retryBaseMs * 2 ** attempt;
+          const jitter = Math.floor(Math.random() * 120);
+          await sleep(backoff + jitter);
+          continue;
+        }
+
+        return this.mapHttpError(lastStatus, lastBody);
       }
 
-      return this.mapHttpError(response.status, await response.text());
+      return this.mapHttpError(lastStatus, lastBody);
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
         return {
