@@ -2,6 +2,8 @@
 
 Fastify API: `POST /execute`, `GET /health`. Each request runs user code in a dedicated Firecracker microVM (rootfs clone per run).
 
+An example env file is **`server/.env.example`**. This process does not load `.env` automatically; use something like systemd `EnvironmentFile=` or export variables before `npm start`.
+
 ## Environment
 
 | Variable | Default | Purpose |
