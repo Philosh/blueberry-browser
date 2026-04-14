@@ -11,7 +11,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const VM_HOST_OVERHEAD_MS = Number(
   process.env.VM_HOST_OVERHEAD_MS ?? 25_000
 );
-const MAX_CONCURRENT_VMS = Number(process.env.MAX_CONCURRENT_VMS ?? 15);
+const MAX_CONCURRENT_VMS = Number(process.env.MAX_CONCURRENT_VMS ?? 2);
 
 /** Logs full Firecracker stderr (truncated) per run. */
 const EXEC_VM_DEBUG =
